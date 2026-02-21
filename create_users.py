@@ -12,14 +12,13 @@ def setup_database():
     with sqlite3.connect(DB_FILE) as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
-                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-                email               TEXT    UNIQUE NOT NULL,
-                birthday            TEXT    NOT NULL,
-                username            TEXT    UNIQUE NOT NULL,
-                password            TEXT    NOT NULL,
-                icloud_app_password TEXT,
-                terms_agreed        INTEGER NOT NULL DEFAULT 1,
-                created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                email        TEXT    UNIQUE NOT NULL,
+                birthday     TEXT    NOT NULL,
+                username     TEXT    UNIQUE NOT NULL,
+                password     TEXT    NOT NULL,
+                terms_agreed INTEGER NOT NULL DEFAULT 1,
+                created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
     print(f"Database ready: {DB_FILE}\n")
@@ -67,7 +66,7 @@ def validate_inputs(email: str, password: str) -> list:
     return errors
 
 
-def create_user(email: str, password: str, icloud_app_password: str = ""):
+def create_user(email: str, password: str):
     """Auto-generate username & birthday, then insert a new user into the database."""
     errors = validate_inputs(email, password)
     if errors:
@@ -82,9 +81,9 @@ def create_user(email: str, password: str, icloud_app_password: str = ""):
         try:
             conn.execute(
                 """INSERT INTO users
-                   (email, birthday, username, password, icloud_app_password, terms_agreed)
-                   VALUES (?, ?, ?, ?, ?, 1)""",
-                (email, birthday, username, password, icloud_app_password),
+                   (email, birthday, username, password, terms_agreed)
+                   VALUES (?, ?, ?, ?, 1)""",
+                (email, birthday, username, password),
             )
             print(f"User created  email={email}  username={username}  birthday={birthday}")
         except sqlite3.IntegrityError as e:
@@ -126,9 +125,8 @@ def main():
             print()
             email = input("Email: ").strip()
             password = input("Password: ")
-            icloud_app_password = input("iCloud app-specific password (optional, press Enter to skip): ").strip()
             print()
-            create_user(email, password, icloud_app_password)
+            create_user(email, password)
             print()
 
         elif choice == "2":

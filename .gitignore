@@ -1,0 +1,9 @@
+# Sensitive credentials — never commit
+icloud_creds.json
+
+# Local database
+users.db
+
+# Python cache
+__pycache__/
+*.pyc

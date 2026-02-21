@@ -1,10 +1,17 @@
 """
-email_2fa.py — iCloud IMAP helper for Riot 2FA codes.
+email_2fa.py — Single iCloud inbox helper for Riot 2FA codes.
 
-Usage:
+All Riot verification emails arrive at one shared iCloud inbox.
+This module logs in once with stored credentials and matches each
+2FA email to the specific Riot account email being signed up.
+
+Setup (run once):
+    python email_2fa.py --setup
+
+Usage in code:
     from email_2fa import fetch_riot_2fa_code
 
-    code = fetch_riot_2fa_code("you@icloud.com", "abcd-efgh-ijkl-mnop")
+    code = fetch_riot_2fa_code("newaccount@gmail.com")
     if code:
         print(f"Got 2FA code: {code}")
     else:
@@ -14,26 +21,74 @@ Requirements:
     - An Apple app-specific password (not your regular Apple ID password).
       Generate one at: appleid.apple.com → Security → App-Specific Passwords
     - iCloud IMAP must be enabled on the account (it is on by default).
+    - Credentials are saved in icloud_creds.json (gitignored).
 """
 
 import imaplib
 import email
+import json
 import re
+import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 ICLOUD_IMAP_HOST = "imap.mail.me.com"
 ICLOUD_IMAP_PORT = 993
 
-# Riot sends verification emails from this address (adjust if needed)
-RIOT_SENDER_PATTERN = re.compile(r"riotgames\.com", re.IGNORECASE)
+CREDS_FILE = Path(__file__).parent / "icloud_creds.json"
 
-# Regex to extract the first 6-digit number from an email body
-CODE_PATTERN = re.compile(r"\b(\d{6})\b")
+# Riot sends verification emails from riotgames.com domains
+RIOT_SENDER_RE = re.compile(r"riotgames\.com", re.IGNORECASE)
 
+# Extract the first 6-digit number from the email body
+CODE_RE = re.compile(r"\b(\d{6})\b")
+
+
+# ---------------------------------------------------------------------------
+# Credential management
+# ---------------------------------------------------------------------------
+
+def save_credentials(icloud_email: str, app_password: str) -> None:
+    """Persist iCloud IMAP credentials to icloud_creds.json."""
+    CREDS_FILE.write_text(
+        json.dumps({"email": icloud_email, "app_password": app_password}, indent=2),
+        encoding="utf-8",
+    )
+    print(f"Credentials saved to {CREDS_FILE}")
+
+
+def load_credentials() -> tuple[str, str]:
+    """Load iCloud credentials from icloud_creds.json.
+
+    Returns (icloud_email, app_password).
+    Raises FileNotFoundError if setup has not been run yet.
+    """
+    if not CREDS_FILE.exists():
+        raise FileNotFoundError(
+            "iCloud credentials not found. Run  python email_2fa.py --setup  first."
+        )
+    data = json.loads(CREDS_FILE.read_text(encoding="utf-8"))
+    return data["email"], data["app_password"]
+
+
+def setup_icloud() -> None:
+    """Interactive prompt to save iCloud IMAP credentials."""
+    print("=== iCloud IMAP setup ===")
+    print("Enter the iCloud account that receives ALL Riot 2FA emails.")
+    print("Use an app-specific password (appleid.apple.com → Security → App-Specific Passwords).\n")
+    icloud_email = input("iCloud email address: ").strip()
+    app_password = input("App-specific password (xxxx-xxxx-xxxx-xxxx): ").strip()
+    save_credentials(icloud_email, app_password)
+    print("\nSetup complete. Test with:  python email_2fa.py <riot_account_email>")
+
+
+# ---------------------------------------------------------------------------
+# IMAP helpers
+# ---------------------------------------------------------------------------
 
 def _decode_payload(msg) -> str:
-    """Extract plain-text body from a email.message.Message object."""
+    """Extract plain-text body from an email.message.Message object."""
     body = ""
     if msg.is_multipart():
         for part in msg.walk():
@@ -52,33 +107,43 @@ def _decode_payload(msg) -> str:
     return body
 
 
+# ---------------------------------------------------------------------------
+# Main public function
+# ---------------------------------------------------------------------------
+
 def fetch_riot_2fa_code(
-    email_address: str,
-    app_password: str,
+    target_email: str,
     timeout: int = 60,
     poll_interval: int = 3,
 ) -> str | None:
     """
-    Connect to iCloud IMAP and wait for a Riot 2FA verification email.
+    Wait for a Riot 2FA email addressed to *target_email* in the shared inbox.
+
+    Credentials are loaded automatically from icloud_creds.json.
 
     Parameters
     ----------
-    email_address   : iCloud address of the account (e.g. you@icloud.com)
-    app_password    : Apple app-specific password for IMAP access
-    timeout         : How many seconds to wait before giving up (default 60)
-    poll_interval   : Seconds between inbox checks (default 3)
+    target_email   : The Riot account email being signed up (used to match
+                     the right 2FA email when multiple accounts are in flight).
+    timeout        : Seconds to wait before giving up (default 60).
+    poll_interval  : Seconds between inbox checks (default 3).
 
     Returns
     -------
     The 6-digit code as a string, or None if timed out.
     """
+    try:
+        icloud_email, app_password = load_credentials()
+    except FileNotFoundError as exc:
+        print(f"[2FA] {exc}")
+        return None
+
     start = datetime.now(timezone.utc)
-    # IMAP date format: DD-Mon-YYYY  (used to filter emails received today)
     since_date = start.strftime("%d-%b-%Y")
 
     try:
         mail = imaplib.IMAP4_SSL(ICLOUD_IMAP_HOST, ICLOUD_IMAP_PORT)
-        mail.login(email_address, app_password)
+        mail.login(icloud_email, app_password)
     except imaplib.IMAP4.error as exc:
         print(f"[2FA] IMAP login failed: {exc}")
         return None
@@ -87,29 +152,34 @@ def fetch_riot_2fa_code(
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             mail.select("INBOX")
-            # Search for unseen emails from Riot received on or after today
+            # Fetch all unseen Riot emails received today
             status, data = mail.search(
                 None, f'(UNSEEN SINCE "{since_date}" FROM "riotgames.com")'
             )
             if status == "OK" and data and data[0]:
-                msg_ids = data[0].split()
-                for msg_id in msg_ids:
+                for msg_id in data[0].split():
                     status2, msg_data = mail.fetch(msg_id, "(RFC822)")
                     if status2 != "OK":
                         continue
-                    raw = msg_data[0][1]
-                    msg = email.message_from_bytes(raw)
 
-                    # Confirm sender contains riotgames.com
+                    msg = email.message_from_bytes(msg_data[0][1])
+
+                    # Confirm it's actually from Riot
                     sender = msg.get("From", "")
-                    if not RIOT_SENDER_PATTERN.search(sender):
+                    if not RIOT_SENDER_RE.search(sender):
                         continue
 
+                    # Match against the target Riot account email
                     body = _decode_payload(msg)
-                    match = CODE_PATTERN.search(body)
-                    if match:
-                        code = match.group(1)
-                        # Mark as read so we don't pick it up again
+                    subject = msg.get("Subject", "")
+                    if target_email.lower() not in body.lower() and \
+                       target_email.lower() not in subject.lower():
+                        # This 2FA email is for a different account; leave it unread
+                        continue
+
+                    code_match = CODE_RE.search(body)
+                    if code_match:
+                        code = code_match.group(1)
                         mail.store(msg_id, "+FLAGS", "\\Seen")
                         return code
 
@@ -123,15 +193,26 @@ def fetch_riot_2fa_code(
     return None
 
 
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
-    import sys
+    if len(sys.argv) == 2 and sys.argv[1] == "--setup":
+        setup_icloud()
+        sys.exit(0)
 
-    if len(sys.argv) != 3:
-        print("Usage: python email_2fa.py <icloud_email> <app_password>")
-        sys.exit(1)
+    if len(sys.argv) == 2:
+        target = sys.argv[1]
+        print(f"Waiting for Riot 2FA email addressed to {target} ...")
+        result = fetch_riot_2fa_code(target)
+        if result:
+            print(f"2FA code: {result}")
+        else:
+            print("No 2FA code received within the timeout.")
+        sys.exit(0 if result else 1)
 
-    result = fetch_riot_2fa_code(sys.argv[1], sys.argv[2])
-    if result:
-        print(f"2FA code: {result}")
-    else:
-        print("No 2FA code received within the timeout.")
+    print("Usage:")
+    print("  python email_2fa.py --setup              # save iCloud credentials")
+    print("  python email_2fa.py <riot_account_email> # wait for 2FA code")
+    sys.exit(1)
