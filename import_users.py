@@ -19,6 +19,7 @@ import csv
 import sys
 import sqlite3
 
+from email_2fa import close_imap
 from create_users import (
     DB_FILE,
     setup_database,
@@ -83,6 +84,7 @@ def import_from_csv(csv_path: str):
                         print(f"  Error     email={email}  {e}")
                         failed += 1
 
+    close_imap()  # cleanly close the shared IMAP session when all rows are done
     print(f"\nDone. Inserted: {inserted}  Skipped (duplicate): {skipped}  Failed: {failed}")
 
 

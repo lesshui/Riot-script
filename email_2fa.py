@@ -44,6 +44,41 @@ RIOT_SENDER_RE = re.compile(r"riotgames\.com", re.IGNORECASE)
 # Extract the first 6-digit number from the email body
 CODE_RE = re.compile(r"\b(\d{6})\b")
 
+# ---------------------------------------------------------------------------
+# Persistent IMAP connection (module-level singleton)
+# ---------------------------------------------------------------------------
+
+_imap_conn: imaplib.IMAP4_SSL | None = None
+
+
+def _get_imap() -> imaplib.IMAP4_SSL:
+    """Return the shared IMAP connection, (re)connecting if needed."""
+    global _imap_conn
+    if _imap_conn is not None:
+        # NOOP keeps the session alive and detects a dropped connection
+        try:
+            _imap_conn.noop()
+            return _imap_conn
+        except Exception:
+            _imap_conn = None  # connection is dead; fall through to reconnect
+
+    icloud_email, app_password = load_credentials()
+    conn = imaplib.IMAP4_SSL(ICLOUD_IMAP_HOST, ICLOUD_IMAP_PORT)
+    conn.login(icloud_email, app_password)
+    _imap_conn = conn
+    return _imap_conn
+
+
+def close_imap() -> None:
+    """Explicitly close the shared IMAP connection (call when fully done)."""
+    global _imap_conn
+    if _imap_conn is not None:
+        try:
+            _imap_conn.logout()
+        except Exception:
+            pass
+        _imap_conn = None
+
 
 # ---------------------------------------------------------------------------
 # Credential management
@@ -132,63 +167,62 @@ def fetch_riot_2fa_code(
     -------
     The 6-digit code as a string, or None if timed out.
     """
-    try:
-        icloud_email, app_password = load_credentials()
-    except FileNotFoundError as exc:
-        print(f"[2FA] {exc}")
-        return None
-
     start = datetime.now(timezone.utc)
     since_date = start.strftime("%d-%b-%Y")
 
     try:
-        mail = imaplib.IMAP4_SSL(ICLOUD_IMAP_HOST, ICLOUD_IMAP_PORT)
-        mail.login(icloud_email, app_password)
+        mail = _get_imap()
+    except FileNotFoundError as exc:
+        print(f"[2FA] {exc}")
+        return None
     except imaplib.IMAP4.error as exc:
         print(f"[2FA] IMAP login failed: {exc}")
         return None
 
-    try:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
             mail.select("INBOX")
             # Fetch all unseen Riot emails received today
             status, data = mail.search(
                 None, f'(UNSEEN SINCE "{since_date}" FROM "riotgames.com")'
             )
-            if status == "OK" and data and data[0]:
-                for msg_id in data[0].split():
-                    status2, msg_data = mail.fetch(msg_id, "(RFC822)")
-                    if status2 != "OK":
-                        continue
+        except imaplib.IMAP4.abort:
+            # Connection dropped mid-run; reconnect once and retry
+            try:
+                mail = _get_imap()
+                continue
+            except Exception:
+                return None
 
-                    msg = email.message_from_bytes(msg_data[0][1])
+        if status == "OK" and data and data[0]:
+            for msg_id in data[0].split():
+                status2, msg_data = mail.fetch(msg_id, "(RFC822)")
+                if status2 != "OK":
+                    continue
 
-                    # Confirm it's actually from Riot
-                    sender = msg.get("From", "")
-                    if not RIOT_SENDER_RE.search(sender):
-                        continue
+                msg = email.message_from_bytes(msg_data[0][1])
 
-                    # Match against the target Riot account email
-                    body = _decode_payload(msg)
-                    subject = msg.get("Subject", "")
-                    if target_email.lower() not in body.lower() and \
-                       target_email.lower() not in subject.lower():
-                        # This 2FA email is for a different account; leave it unread
-                        continue
+                # Confirm it's actually from Riot
+                sender = msg.get("From", "")
+                if not RIOT_SENDER_RE.search(sender):
+                    continue
 
-                    code_match = CODE_RE.search(body)
-                    if code_match:
-                        code = code_match.group(1)
-                        mail.store(msg_id, "+FLAGS", "\\Seen")
-                        return code
+                # Match against the target Riot account email
+                body = _decode_payload(msg)
+                subject = msg.get("Subject", "")
+                if target_email.lower() not in body.lower() and \
+                   target_email.lower() not in subject.lower():
+                    # This 2FA email is for a different account; leave it unread
+                    continue
 
-            time.sleep(poll_interval)
-    finally:
-        try:
-            mail.logout()
-        except Exception:
-            pass
+                code_match = CODE_RE.search(body)
+                if code_match:
+                    code = code_match.group(1)
+                    mail.store(msg_id, "+FLAGS", "\\Seen")
+                    return code
+
+        time.sleep(poll_interval)
 
     return None
 
